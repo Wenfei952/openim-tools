@@ -22,6 +22,7 @@ import (
 )
 
 var ErrNotSupported = errors.New("discovery data not supported")
+var ErrNotSupportedKeyValue = errors.New("discovery key value not supported")
 
 type Conn interface {
 	GetConn(ctx context.Context, serviceName string, opts ...grpc.DialOption) (grpc.ClientConnInterface, error)

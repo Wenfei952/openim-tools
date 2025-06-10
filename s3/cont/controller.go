@@ -31,16 +31,22 @@ import (
 	"github.com/openimsdk/tools/log"
 )
 
-func New(cache S3Cache, impl s3.Interface) *Controller {
+func New(cache S3Cache, impl s3.Interface, skipETagValidation ...bool) *Controller {
+	skip := false // 默认值：不跳过ETag验证
+	if len(skipETagValidation) > 0 {
+		skip = skipETagValidation[0]
+	}
 	return &Controller{
-		cache: cache,
-		impl:  impl,
+		cache:              cache,
+		impl:               impl,
+		skipETagValidation: skip,
 	}
 }
 
 type Controller struct {
-	cache S3Cache
-	impl  s3.Interface
+	cache              S3Cache
+	impl               s3.Interface
+	skipETagValidation bool // 是否跳过ETag验证（用于Cloudflare R2等存储服务）
 }
 
 func (c *Controller) Engine() string {
@@ -334,7 +340,16 @@ func (c *Controller) CompleteUpload(ctx context.Context, uploadID string, partHa
 		}
 		cleanObject[copyInfo.Key] = struct{}{}
 		if copyInfo.ETag != uploadInfo.ETag {
-			return nil, errors.New("[concurrency]copy md5 mismatching")
+			if c.skipETagValidation {
+				log.ZWarn(ctx, "[s3] ETag mismatch detected, but skipETagValidation is enabled",
+					nil,
+					"engine", c.impl.Engine(),
+					"originalETag", uploadInfo.ETag,
+					"copyETag", copyInfo.ETag,
+					"key", uploadInfo.Key)
+			} else {
+				return nil, errors.New("[concurrency]copy md5 mismatching")
+			}
 		}
 		hashCopyInfo, err := c.impl.CopyObject(ctx, copyInfo.Key, c.HashPath(upload.Hash))
 		if err != nil {
