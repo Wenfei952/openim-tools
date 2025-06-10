@@ -16,7 +16,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	aws3 "github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
-	smithyendpoints "github.com/aws/smithy-go/endpoints"
 	"github.com/openimsdk/tools/s3"
 )
 
@@ -38,20 +37,30 @@ type Config struct {
 }
 
 func NewAws(conf Config) (*Aws, error) {
+	// 如果没有设置Region且设置了Endpoint，默认使用"auto"（R2标准）
+	region := conf.Region
+	if region == "" && conf.Endpoint != "" {
+		region = "auto"
+	}
+
 	cfg := aws.Config{
-		Region:      conf.Region,
+		Region:      region,
 		Credentials: credentials.NewStaticCredentialsProvider(conf.AccessKeyID, conf.SecretAccessKey, conf.SessionToken),
 	}
 
 	client := aws3.NewFromConfig(cfg, func(o *aws3.Options) {
-		// 如果指定了自定义端点（如R2），则使用自定义resolver和路径风格访问
+		// 如果指定了自定义端点（如R2），则配置endpoint和路径风格访问
 		if conf.Endpoint != "" {
-			o.EndpointResolverV2 = &customEndpointResolver{endpoint: conf.Endpoint}
+			// 添加调试信息
+			fmt.Printf("DEBUG: Setting custom endpoint: %s\n", conf.Endpoint)
+			fmt.Printf("DEBUG: Region: %s, Bucket: %s\n", region, conf.Bucket)
+
+			// 使用BaseEndpoint，这与R2官方示例一致
+			o.BaseEndpoint = aws.String(conf.Endpoint)
+			// 对于R2等S3兼容服务，通常需要路径风格访问
 			o.UsePathStyle = true
-			// 确保使用指定的region，而不是从endpoint推断
-			if conf.Region != "" {
-				o.Region = conf.Region
-			}
+		} else {
+			fmt.Printf("DEBUG: No custom endpoint configured, using default AWS endpoint\n")
 		}
 	})
 
@@ -431,23 +440,4 @@ func (d *disableHTTPPresignerHeaderV4) setOption(u *url.URL) {
 		query.Set("response-content-disposition", `attachment; filename*=UTF-8''`+url.PathEscape(d.opt.Filename))
 	}
 	u.RawQuery = query.Encode()
-}
-
-// customEndpointResolver 为R2等S3兼容服务提供自定义endpoint解析
-type customEndpointResolver struct {
-	endpoint string
-}
-
-func (r *customEndpointResolver) ResolveEndpoint(ctx context.Context, params aws3.EndpointParameters) (smithyendpoints.Endpoint, error) {
-	if r.endpoint != "" {
-		u, err := url.Parse(r.endpoint)
-		if err != nil {
-			return smithyendpoints.Endpoint{}, err
-		}
-		return smithyendpoints.Endpoint{
-			URI: *u,
-		}, nil
-	}
-	// 回退到默认resolver
-	return aws3.NewDefaultEndpointResolverV2().ResolveEndpoint(ctx, params)
 }
