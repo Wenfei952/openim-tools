@@ -16,6 +16,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	aws3 "github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	smithyendpoints "github.com/aws/smithy-go/endpoints"
 	"github.com/openimsdk/tools/s3"
 )
 
@@ -42,20 +43,15 @@ func NewAws(conf Config) (*Aws, error) {
 		Credentials: credentials.NewStaticCredentialsProvider(conf.AccessKeyID, conf.SecretAccessKey, conf.SessionToken),
 	}
 
-	// 如果指定了自定义端点（如R2），则配置endpoint resolver
-	if conf.Endpoint != "" {
-		cfg.EndpointResolverWithOptions = aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
-			return aws.Endpoint{
-				URL:               conf.Endpoint,
-				HostnameImmutable: true,
-			}, nil
-		})
-	}
-
 	client := aws3.NewFromConfig(cfg, func(o *aws3.Options) {
-		// 对于R2等S3兼容服务，通常需要使用路径风格访问
+		// 如果指定了自定义端点（如R2），则使用自定义resolver和路径风格访问
 		if conf.Endpoint != "" {
+			o.EndpointResolverV2 = &customEndpointResolver{endpoint: conf.Endpoint}
 			o.UsePathStyle = true
+			// 确保使用指定的region，而不是从endpoint推断
+			if conf.Region != "" {
+				o.Region = conf.Region
+			}
 		}
 	})
 
@@ -435,4 +431,23 @@ func (d *disableHTTPPresignerHeaderV4) setOption(u *url.URL) {
 		query.Set("response-content-disposition", `attachment; filename*=UTF-8''`+url.PathEscape(d.opt.Filename))
 	}
 	u.RawQuery = query.Encode()
+}
+
+// customEndpointResolver 为R2等S3兼容服务提供自定义endpoint解析
+type customEndpointResolver struct {
+	endpoint string
+}
+
+func (r *customEndpointResolver) ResolveEndpoint(ctx context.Context, params aws3.EndpointParameters) (smithyendpoints.Endpoint, error) {
+	if r.endpoint != "" {
+		u, err := url.Parse(r.endpoint)
+		if err != nil {
+			return smithyendpoints.Endpoint{}, err
+		}
+		return smithyendpoints.Endpoint{
+			URI: *u,
+		}, nil
+	}
+	// 回退到默认resolver
+	return aws3.NewDefaultEndpointResolverV2().ResolveEndpoint(ctx, params)
 }
