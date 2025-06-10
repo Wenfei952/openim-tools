@@ -1,4 +1,4 @@
-module github.com/openimsdk/tools
+module github.com/Wenfei952/openim-tools
 
 go 1.22.0
 
