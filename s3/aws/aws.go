@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/aws/signer/v4"
+	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	aws3 "github.com/aws/aws-sdk-go-v2/service/s3"
@@ -31,6 +31,9 @@ type Config struct {
 	AccessKeyID     string
 	SecretAccessKey string
 	SessionToken    string
+	Endpoint        string // 自定义端点，用于支持R2等S3兼容服务
+	BucketURL       string // 自定义bucket URL，用于特殊的访问模式
+	PublicRead      bool   // 是否启用公开读取模式，当此项为true时，AccessURL将返回直接访问URL而非签名URL
 }
 
 func NewAws(conf Config) (*Aws, error) {
@@ -38,18 +41,39 @@ func NewAws(conf Config) (*Aws, error) {
 		Region:      conf.Region,
 		Credentials: credentials.NewStaticCredentialsProvider(conf.AccessKeyID, conf.SecretAccessKey, conf.SessionToken),
 	}
-	client := aws3.NewFromConfig(cfg)
+
+	// 如果指定了自定义端点（如R2），则配置endpoint resolver
+	if conf.Endpoint != "" {
+		cfg.EndpointResolverWithOptions = aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
+			return aws.Endpoint{
+				URL:               conf.Endpoint,
+				HostnameImmutable: true,
+			}, nil
+		})
+	}
+
+	client := aws3.NewFromConfig(cfg, func(o *aws3.Options) {
+		// 对于R2等S3兼容服务，通常需要使用路径风格访问
+		if conf.Endpoint != "" {
+			o.UsePathStyle = true
+		}
+	})
+
 	return &Aws{
-		bucket:  conf.Bucket,
-		client:  client,
-		presign: aws3.NewPresignClient(client),
+		bucket:     conf.Bucket,
+		client:     client,
+		presign:    aws3.NewPresignClient(client),
+		bucketURL:  conf.BucketURL,
+		publicRead: conf.PublicRead,
 	}, nil
 }
 
 type Aws struct {
-	bucket  string
-	client  *aws3.Client
-	presign *aws3.PresignClient
+	bucket     string
+	client     *aws3.Client
+	presign    *aws3.PresignClient
+	bucketURL  string
+	publicRead bool
 }
 
 func (a *Aws) Engine() string {
@@ -101,7 +125,24 @@ func (a *Aws) PresignedPutObject(ctx context.Context, name string, expire time.D
 	if err != nil {
 		return nil, err
 	}
-	return &s3.PresignedPutResult{URL: res.URL}, nil
+
+	resultURL := res.URL
+	// 如果配置了自定义的bucketURL（用于R2等服务的特殊访问模式），则替换URL的host部分
+	if a.bucketURL != "" {
+		u, err := url.Parse(res.URL)
+		if err != nil {
+			return nil, err
+		}
+		bucketU, err := url.Parse(a.bucketURL)
+		if err != nil {
+			return nil, err
+		}
+		u.Scheme = bucketU.Scheme
+		u.Host = bucketU.Host
+		resultURL = u.String()
+	}
+
+	return &s3.PresignedPutResult{URL: resultURL}, nil
 }
 
 func (a *Aws) DeleteObject(ctx context.Context, name string) error {
@@ -266,6 +307,17 @@ func (a *Aws) AuthSign(ctx context.Context, uploadID string, name string, expire
 		if err != nil {
 			return nil, err
 		}
+
+		// 如果配置了自定义的bucketURL，则替换URL的host部分
+		if a.bucketURL != "" {
+			bucketU, err := url.Parse(a.bucketURL)
+			if err != nil {
+				return nil, err
+			}
+			u.Scheme = bucketU.Scheme
+			u.Host = bucketU.Host
+		}
+
 		query := u.Query()
 		u.RawQuery = ""
 		urlstr := u.String()
@@ -286,6 +338,37 @@ func (a *Aws) AuthSign(ctx context.Context, uploadID string, name string, expire
 }
 
 func (a *Aws) AccessURL(ctx context.Context, name string, expire time.Duration, opt *s3.AccessURLOption) (string, error) {
+	// 如果启用了公开读取模式且配置了bucketURL，则直接返回公开访问URL
+	if a.publicRead && a.bucketURL != "" {
+		bucketU, err := url.Parse(a.bucketURL)
+		if err != nil {
+			return "", err
+		}
+
+		// 构建直接访问URL：bucketURL + "/" + objectName
+		baseURL := strings.TrimSuffix(bucketU.String(), "/")
+		directURL := baseURL + "/" + name
+
+		// 如果有选项参数，添加query参数
+		if opt != nil {
+			u, err := url.Parse(directURL)
+			if err != nil {
+				return "", err
+			}
+			query := u.Query()
+			if opt.ContentType != "" {
+				query.Set("response-content-type", opt.ContentType)
+			}
+			if opt.Filename != "" {
+				query.Set("response-content-disposition", `attachment; filename*=UTF-8''`+url.PathEscape(opt.Filename))
+			}
+			u.RawQuery = query.Encode()
+			return u.String(), nil
+		}
+
+		return directURL, nil
+	}
+
 	params := &aws3.GetObjectInput{
 		Bucket: aws.String(a.bucket),
 		Key:    aws.String(name),
@@ -294,6 +377,22 @@ func (a *Aws) AccessURL(ctx context.Context, name string, expire time.Duration, 
 	if err != nil {
 		return "", err
 	}
+
+	// 如果配置了自定义的bucketURL（用于R2等服务的特殊访问模式），则替换URL的host部分
+	if a.bucketURL != "" {
+		u, err := url.Parse(res.URL)
+		if err != nil {
+			return "", err
+		}
+		bucketU, err := url.Parse(a.bucketURL)
+		if err != nil {
+			return "", err
+		}
+		u.Scheme = bucketU.Scheme
+		u.Host = bucketU.Host
+		return u.String(), nil
+	}
+
 	return res.URL, nil
 }
 
